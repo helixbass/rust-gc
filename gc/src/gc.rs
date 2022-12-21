@@ -1,5 +1,6 @@
 use crate::trace::Trace;
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::mem;
 use std::ptr::{self, NonNull};
 
@@ -52,6 +53,7 @@ const ROOTS_MAX: usize = ROOTS_MASK; // max allowed value of roots
 pub(crate) struct GcBoxHeader {
     roots: Cell<usize>, // high bit is used as mark flag
     next: Cell<Option<NonNull<GcBox<dyn Trace>>>>,
+    dyn_trace_ptr: Cell<Option<NonNull<GcBox<dyn Trace>>>>,
 }
 
 impl GcBoxHeader {
@@ -60,6 +62,7 @@ impl GcBoxHeader {
         GcBoxHeader {
             roots: Cell::new(1), // unmarked and roots count = 1
             next: Cell::new(next),
+            dyn_trace_ptr: Default::default(),
         }
     }
 
@@ -100,6 +103,14 @@ impl GcBoxHeader {
     pub fn unmark(&self) {
         self.roots.set(self.roots.get() & !MARK_MASK)
     }
+
+    pub fn push_onto_mark_queue(&self) {
+        MARK_QUEUE.with(|queue| {
+            queue
+                .borrow_mut()
+                .push_back((self.dyn_trace_ptr.get().unwrap(), true));
+        });
+    }
 }
 
 #[repr(C)] // to justify the layout computation in Gc::from_raw
@@ -137,8 +148,13 @@ impl<T: Trace> GcBox<T> {
                 data: value,
             }));
 
-            st.boxes_start
-                .set(Some(unsafe { NonNull::new_unchecked(gcbox) }));
+            let dyn_trace_ptr: NonNull<GcBox<dyn Trace>> = unsafe { NonNull::new_unchecked(gcbox) };
+
+            unsafe {
+                (*gcbox).header.dyn_trace_ptr.set(Some(dyn_trace_ptr));
+            }
+
+            st.boxes_start.set(Some(dyn_trace_ptr));
 
             // We allocated some bytes! Let's record it
             st.stats.bytes_allocated += mem::size_of::<GcBox<T>>();
@@ -157,12 +173,17 @@ impl<T: Trace + ?Sized> GcBox<T> {
         ptr::eq(&this.header, &other.header)
     }
 
-    /// Marks this `GcBox` and marks through its data.
+    /// Marks this `GcBox` and queues it to have its data marked.
     pub(crate) unsafe fn trace_inner(&self) {
         if !self.header.is_marked() {
             self.header.mark();
-            self.data.trace();
+            self.header.push_onto_mark_queue();
         }
+    }
+
+    /// Marks this `GcBox`'s data.
+    pub(crate) unsafe fn mark_data(&self) {
+        self.data.trace();
     }
 
     /// Increases the root count on this `GcBox`.
@@ -188,6 +209,10 @@ impl<T: Trace + ?Sized> GcBox<T> {
     }
 }
 
+thread_local!(
+    static MARK_QUEUE: RefCell<VecDeque<(NonNull<GcBox<dyn Trace>>, bool)>> = Default::default();
+);
+
 /// Collects garbage.
 fn collect_garbage(st: &mut GcState) {
     st.stats.collections_performed += 1;
@@ -198,14 +223,30 @@ fn collect_garbage(st: &mut GcState) {
     }
     unsafe fn mark(head: &Cell<Option<NonNull<GcBox<dyn Trace>>>>) -> Vec<Unmarked<'_>> {
         // Walk the tree, tracing and marking the nodes
-        let mut mark_head = head.get();
-        while let Some(node) = mark_head {
-            if (*node.as_ptr()).header.roots() > 0 {
-                (*node.as_ptr()).trace_inner();
+        MARK_QUEUE.with(|queue| {
+            queue.borrow_mut().clear();
+            let mut mark_head = head.get();
+            if let Some(mark_head) = mark_head {
+                queue.borrow_mut().push_back((mark_head, false));
             }
+            while let Some((node, pre_marked)) = {
+                let value = queue.borrow_mut().pop_front();
+                value
+            } {
+                if pre_marked {
+                    (*node.as_ptr()).mark_data();
+                } else {
+                    if (*node.as_ptr()).header.roots() > 0 {
+                        (*node.as_ptr()).trace_inner();
+                    }
+                }
 
-            mark_head = (*node.as_ptr()).header.next.get();
-        }
+                mark_head = (*node.as_ptr()).header.next.get();
+                if let Some(mark_head) = mark_head {
+                    queue.borrow_mut().push_back((mark_head, false));
+                }
+            }
+        });
 
         // Collect a vector of all of the nodes which were not marked,
         // and unmark the ones which were.
