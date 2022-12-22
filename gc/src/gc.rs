@@ -201,8 +201,6 @@ impl<T: Trace + ?Sized> GcBox<T> {
     }
 }
 
-thread_local!(pub(crate) static IS_MARKING: Cell<bool> = Default::default());
-
 thread_local!(static MARK_QUEUE: RefCell<Vec<NonNull<GcBox<dyn Trace>>>> = Default::default());
 
 /// Collects garbage.
@@ -215,16 +213,17 @@ fn collect_garbage(st: &mut GcState) {
     }
     unsafe fn mark(head: &Cell<Option<NonNull<GcBox<dyn Trace>>>>) -> Vec<Unmarked<'_>> {
         // Walk the tree, tracing and marking the nodes
-        IS_MARKING.with(|is_marking| is_marking.set(true));
         let mut mark_head = head.get();
-        while let Some(node) = mark_head {
-            if (*node.as_ptr()).header.roots() > 0 {
-                (*node.as_ptr()).trace_inner();
+        MARK_QUEUE.with(|queue| {
+            queue.borrow_mut().clear();
+            while let Some(node) = mark_head {
+                if (*node.as_ptr()).header.roots() > 0 {
+                    (*node.as_ptr()).trace_inner();
+                }
+
+                mark_head = (*node.as_ptr()).header.next.get();
             }
 
-            mark_head = (*node.as_ptr()).header.next.get();
-        }
-        MARK_QUEUE.with(|queue| {
             while let Some(node) = {
                 let value = queue.borrow_mut().pop();
                 value
@@ -232,7 +231,6 @@ fn collect_garbage(st: &mut GcState) {
                 (*node.as_ptr()).trace_inner();
             }
         });
-        IS_MARKING.with(|is_marking| is_marking.set(false));
 
         // Collect a vector of all of the nodes which were not marked,
         // and unmark the ones which were.
