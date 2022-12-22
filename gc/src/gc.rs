@@ -52,6 +52,7 @@ const ROOTS_MAX: usize = ROOTS_MASK; // max allowed value of roots
 pub(crate) struct GcBoxHeader {
     roots: Cell<usize>, // high bit is used as mark flag
     next: Cell<Option<NonNull<GcBox<dyn Trace>>>>,
+    dyn_trace_ptr: Cell<Option<NonNull<GcBox<dyn Trace>>>>,
 }
 
 impl GcBoxHeader {
@@ -60,6 +61,7 @@ impl GcBoxHeader {
         GcBoxHeader {
             roots: Cell::new(1), // unmarked and roots count = 1
             next: Cell::new(next),
+            dyn_trace_ptr: Default::default(),
         }
     }
 
@@ -100,11 +102,17 @@ impl GcBoxHeader {
     pub fn unmark(&self) {
         self.roots.set(self.roots.get() & !MARK_MASK)
     }
+
+    pub fn push_onto_mark_queue(&self) {
+        MARK_QUEUE.with(|queue| {
+            queue.borrow_mut().push(self.dyn_trace_ptr.get().unwrap());
+        });
+    }
 }
 
 #[repr(C)] // to justify the layout computation in Gc::from_raw
 pub(crate) struct GcBox<T: Trace + ?Sized + 'static> {
-    header: GcBoxHeader,
+    pub header: GcBoxHeader,
     data: T,
 }
 
@@ -137,8 +145,13 @@ impl<T: Trace> GcBox<T> {
                 data: value,
             }));
 
-            st.boxes_start
-                .set(Some(unsafe { NonNull::new_unchecked(gcbox) }));
+            let dyn_trace_ptr: NonNull<GcBox<dyn Trace>> = unsafe { NonNull::new_unchecked(gcbox) };
+
+            unsafe {
+                (*gcbox).header.dyn_trace_ptr.set(Some(dyn_trace_ptr));
+            }
+
+            st.boxes_start.set(Some(dyn_trace_ptr));
 
             // We allocated some bytes! Let's record it
             st.stats.bytes_allocated += mem::size_of::<GcBox<T>>();
@@ -188,6 +201,10 @@ impl<T: Trace + ?Sized> GcBox<T> {
     }
 }
 
+thread_local!(pub(crate) static IS_MARKING: Cell<bool> = Default::default());
+
+thread_local!(static MARK_QUEUE: RefCell<Vec<NonNull<GcBox<dyn Trace>>>> = Default::default());
+
 /// Collects garbage.
 fn collect_garbage(st: &mut GcState) {
     st.stats.collections_performed += 1;
@@ -198,6 +215,7 @@ fn collect_garbage(st: &mut GcState) {
     }
     unsafe fn mark(head: &Cell<Option<NonNull<GcBox<dyn Trace>>>>) -> Vec<Unmarked<'_>> {
         // Walk the tree, tracing and marking the nodes
+        IS_MARKING.with(|is_marking| is_marking.set(true));
         let mut mark_head = head.get();
         while let Some(node) = mark_head {
             if (*node.as_ptr()).header.roots() > 0 {
@@ -206,6 +224,15 @@ fn collect_garbage(st: &mut GcState) {
 
             mark_head = (*node.as_ptr()).header.next.get();
         }
+        MARK_QUEUE.with(|queue| {
+            while let Some(node) = {
+                let value = queue.borrow_mut().pop();
+                value
+            } {
+                (*node.as_ptr()).trace_inner();
+            }
+        });
+        IS_MARKING.with(|is_marking| is_marking.set(false));
 
         // Collect a vector of all of the nodes which were not marked,
         // and unmark the ones which were.

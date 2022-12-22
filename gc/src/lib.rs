@@ -6,7 +6,7 @@
 
 #![cfg_attr(feature = "nightly", feature(coerce_unsized, unsize))]
 
-use crate::gc::{GcBox, GcBoxHeader};
+use crate::gc::{GcBox, GcBoxHeader, IS_MARKING};
 use std::alloc::Layout;
 use std::cell::{Cell, UnsafeCell};
 use std::cmp::Ordering;
@@ -221,7 +221,13 @@ impl<T: Trace + ?Sized> Finalize for Gc<T> {}
 unsafe impl<T: Trace + ?Sized> Trace for Gc<T> {
     #[inline]
     unsafe fn trace(&self) {
-        self.inner().trace_inner();
+        IS_MARKING.with(|is_marking| {
+            if is_marking.get() && self.inner().header.roots() == 0 {
+                self.inner().header.push_onto_mark_queue();
+            } else {
+                self.inner().trace_inner();
+            }
+        });
     }
 
     #[inline]
