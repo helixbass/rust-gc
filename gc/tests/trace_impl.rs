@@ -1,10 +1,8 @@
-use gc_derive::{Finalize, Trace};
+use gc::{Finalize, Trace};
 use std::cell::RefCell;
 use std::rc::Rc;
 
 thread_local!(static X: RefCell<u8> = RefCell::new(0));
-
-use gc::Trace;
 
 #[derive(Copy, Clone, Finalize)]
 struct Foo;
@@ -14,7 +12,7 @@ unsafe impl Trace for Foo {
         X.with(|x| {
             let mut m = x.borrow_mut();
             *m += 1;
-        })
+        });
     }
     unsafe fn root(&self) {}
     unsafe fn unroot(&self) {}
@@ -46,11 +44,6 @@ struct InnerRcStr {
     inner: Rc<str>,
 }
 
-#[derive(Trace, Clone, Finalize)]
-struct InnerRcStruct {
-    inner: Rc<Bar>,
-}
-
 #[derive(Trace, Finalize)]
 struct Baz {
     a: Bar,
@@ -66,7 +59,7 @@ fn test() {
     X.with(|x| assert!(*x.borrow() == 1));
     let baz = Baz {
         a: bar.clone(),
-        b: bar.clone(),
+        b: bar,
     };
     unsafe {
         baz.trace();

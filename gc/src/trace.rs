@@ -30,7 +30,7 @@ pub unsafe trait Trace: Finalize {
     /// Decrements the root-count of all contained `Gc`s.
     unsafe fn unroot(&self);
 
-    /// Runs Finalize::finalize() on this object and all
+    /// Runs `Finalize::finalize()` on this object and all
     /// contained subobjects
     fn finalize_glue(&self);
 }
@@ -91,11 +91,11 @@ macro_rules! custom_trace {
         }
         #[inline]
         fn finalize_glue(&self) {
-            $crate::Finalize::finalize(self);
             #[inline]
             fn mark<T: $crate::Trace + ?Sized>(it: &T) {
                 $crate::Trace::finalize_glue(it);
             }
+            $crate::Finalize::finalize(self);
             let $this = self;
             $body
         }
@@ -135,7 +135,7 @@ simple_empty_finalize_trace![
     f64,
     char,
     String,
-    Box<str>,
+    str,
     Rc<str>,
     Path,
     PathBuf,
@@ -237,22 +237,6 @@ type_arg_tuple_based_finalize_trace_impls![
     (A, B, C, D, E, F, G, H, I, J, K, L);
 ];
 
-impl<T: Trace + ?Sized> Finalize for Rc<T> {}
-unsafe impl<T: Trace + ?Sized> Trace for Rc<T> {
-    custom_trace!(this, {
-        mark(&**this);
-    });
-}
-
-impl<T: Trace> Finalize for Rc<[T]> {}
-unsafe impl<T: Trace> Trace for Rc<[T]> {
-    custom_trace!(this, {
-        for e in this.iter() {
-            mark(e);
-        }
-    });
-}
-
 impl<T: Trace + ?Sized> Finalize for Box<T> {}
 unsafe impl<T: Trace + ?Sized> Trace for Box<T> {
     custom_trace!(this, {
@@ -260,10 +244,10 @@ unsafe impl<T: Trace + ?Sized> Trace for Box<T> {
     });
 }
 
-impl<T: Trace> Finalize for Box<[T]> {}
-unsafe impl<T: Trace> Trace for Box<[T]> {
+impl<T: Trace> Finalize for [T] {}
+unsafe impl<T: Trace> Trace for [T] {
     custom_trace!(this, {
-        for e in this.iter() {
+        for e in this {
             mark(e);
         }
     });
@@ -353,8 +337,8 @@ unsafe impl<T: Eq + Hash + Trace> Trace for LinkedList<T> {
     });
 }
 
-impl<T> Finalize for PhantomData<T> {}
-unsafe impl<T> Trace for PhantomData<T> {
+impl<T: ?Sized> Finalize for PhantomData<T> {}
+unsafe impl<T: ?Sized> Trace for PhantomData<T> {
     unsafe_empty_trace!();
 }
 

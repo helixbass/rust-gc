@@ -1,5 +1,4 @@
-use gc::{force_collect, Gc, GcCell};
-use gc_derive::Trace;
+use gc::{force_collect, Gc, GcCell, Trace};
 use std::cell::Cell;
 
 thread_local!(static COUNTER: Cell<u8> = Cell::new(0u8));
@@ -36,8 +35,8 @@ fn test_cycle() {
         *gcs[0].prev.borrow_mut() = Some(last);
     }
 
-    println!("Before collection: {:?}", COUNTER.with(|s| s.get()));
+    println!("Before collection: {:?}", COUNTER.with(Cell::get));
     force_collect();
-    println!("After collection: {:?}", COUNTER.with(|s| s.get()));
-    assert_eq!(COUNTER.with(|s| s.get()), 4);
+    println!("After collection: {:?}", COUNTER.with(Cell::get));
+    assert_eq!(COUNTER.with(Cell::get), 4);
 }

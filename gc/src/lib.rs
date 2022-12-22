@@ -72,22 +72,30 @@ impl<T: Trace> Gc<T> {
     /// assert_eq!(*five, 5);
     /// ```
     pub fn new(value: T) -> Self {
-        assert!(mem::align_of::<GcBox<T>>() > 1);
+        unsafe { Gc::from_gcbox(GcBox::new(value)) }
+    }
+}
 
-        unsafe {
-            // Allocate the memory for the object
-            let ptr = GcBox::new(value);
+impl<T: Trace + ?Sized> Gc<T> {
+    /// Constructs a `Gc` that points to a new `GcBox`.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must point to a valid `GcBox` on the thread-local
+    /// `GcBox` chain.
+    #[inline]
+    unsafe fn from_gcbox(ptr: NonNull<GcBox<T>>) -> Gc<T> {
+        assert!(mem::align_of_val::<GcBox<T>>(ptr.as_ref()) > 1);
 
-            // When we create a Gc<T>, all pointers which have been moved to the
-            // heap no longer need to be rooted, so we unroot them.
-            (*ptr.as_ptr()).value().unroot();
-            let gc = Gc {
-                ptr_root: Cell::new(NonNull::new_unchecked(ptr.as_ptr())),
-                marker: PhantomData,
-            };
-            gc.set_root();
-            gc
-        }
+        // When we create a Gc<T>, all pointers which have been moved to the
+        // heap no longer need to be rooted, so we unroot them.
+        ptr.as_ref().value().unroot();
+        let gc = Gc {
+            ptr_root: Cell::new(ptr),
+            marker: PhantomData,
+        };
+        gc.set_root();
+        gc
     }
 }
 
@@ -101,7 +109,7 @@ impl<T: Trace + ?Sized> Gc<T> {
 /// Returns the given pointer with its root bit cleared.
 unsafe fn clear_root_bit<T: ?Sized + Trace>(ptr: NonNull<GcBox<T>>) -> NonNull<GcBox<T>> {
     let ptr = ptr.as_ptr();
-    let data = ptr as *mut u8;
+    let data = ptr.cast::<u8>();
     let addr = data as isize;
     let ptr = set_data_ptr(ptr, data.wrapping_offset((addr & !1) - addr));
     NonNull::new_unchecked(ptr)
@@ -109,12 +117,12 @@ unsafe fn clear_root_bit<T: ?Sized + Trace>(ptr: NonNull<GcBox<T>>) -> NonNull<G
 
 impl<T: Trace + ?Sized> Gc<T> {
     fn rooted(&self) -> bool {
-        self.ptr_root.get().as_ptr() as *mut u8 as usize & 1 != 0
+        self.ptr_root.get().as_ptr().cast::<u8>() as usize & 1 != 0
     }
 
     unsafe fn set_root(&self) {
         let ptr = self.ptr_root.get().as_ptr();
-        let data = ptr as *mut u8;
+        let data = ptr.cast::<u8>();
         let addr = data as isize;
         let ptr = set_data_ptr(ptr, data.wrapping_offset((addr | 1) - addr));
         self.ptr_root.set(NonNull::new_unchecked(ptr));
@@ -159,6 +167,7 @@ impl<T: Trace + ?Sized> Gc<T> {
     /// let x = Gc::new(22);
     /// let x_ptr = Gc::into_raw(x);
     /// assert_eq!(unsafe { *x_ptr }, 22);
+    /// unsafe { Gc::from_raw(x_ptr) };
     /// ```
     pub fn into_raw(this: Self) -> *const T {
         let ptr: *const T = GcBox::value_ptr(this.inner_ptr());
@@ -274,7 +283,7 @@ impl<T: Trace + ?Sized> Deref for Gc<T> {
 
     #[inline]
     fn deref(&self) -> &T {
-        &self.inner().value()
+        self.inner().value()
     }
 }
 
@@ -370,15 +379,28 @@ impl<T: Trace> From<T> for Gc<T> {
     }
 }
 
+impl<
+        #[cfg(not(feature = "nightly"))] T: Trace,
+        #[cfg(feature = "nightly")] T: Trace + Unsize<dyn Trace> + ?Sized,
+    > From<Box<T>> for Gc<T>
+{
+    /// Moves a boxed value into a new garbage-collected
+    /// allocation. If the `nightly` crate feature is enabled, the
+    /// value may be an unsized trait object.
+    fn from(v: Box<T>) -> Gc<T> {
+        unsafe { Gc::from_gcbox(GcBox::from_box(v)) }
+    }
+}
+
 impl<T: Trace + ?Sized> std::borrow::Borrow<T> for Gc<T> {
     fn borrow(&self) -> &T {
-        &**self
+        self
     }
 }
 
 impl<T: Trace + ?Sized> std::convert::AsRef<T> for Gc<T> {
     fn as_ref(&self) -> &T {
-        &**self
+        self
     }
 }
 
@@ -386,13 +408,13 @@ impl<T: Trace + ?Sized> std::convert::AsRef<T> for Gc<T> {
 // GcCell //
 ////////////
 
-/// The BorrowFlag used by GC is split into 2 parts. the upper 63 or 31 bits
+/// The `BorrowFlag` used by GC is split into 2 parts. the upper 63 or 31 bits
 /// (depending on the architecture) are used to store the number of borrowed
 /// references to the type. The low bit is used to record the rootedness of the
 /// type.
 ///
-/// This means that GcCell can have, at maximum, half as many outstanding
-/// borrows as RefCell before panicking. I don't think that will be a problem.
+/// This means that `GcCell` can have, at maximum, half as many outstanding
+/// borrows as `RefCell` before panicking. I don't think that will be a problem.
 #[derive(Copy, Clone)]
 struct BorrowFlag(usize);
 
@@ -420,10 +442,7 @@ impl BorrowFlag {
     }
 
     fn rooted(self) -> bool {
-        match self.0 & ROOT {
-            0 => false,
-            _ => true,
-        }
+        self.0 & ROOT != 0
     }
 
     fn set_writing(self) -> Self {
@@ -459,7 +478,7 @@ impl BorrowFlag {
 
     fn set_rooted(self, rooted: bool) -> Self {
         // Preserve the non-root bits
-        BorrowFlag((self.0 & !ROOT) | (rooted as usize))
+        BorrowFlag((self.0 & !ROOT) | usize::from(rooted))
     }
 }
 
@@ -685,7 +704,9 @@ impl<'a, T: ?Sized> GcCellRef<'a, T> {
     /// `GcCellRef::clone(...)`. A `Clone` implementation or a method
     /// would interfere with the use of `c.borrow().clone()` to clone
     /// the contents of a `GcCell`.
+    #[allow(clippy::should_implement_trait)]
     #[inline]
+    #[must_use]
     pub fn clone(orig: &GcCellRef<'a, T>) -> GcCellRef<'a, T> {
         orig.flags.set(orig.flags.get().add_reading());
         GcCellRef {
@@ -734,7 +755,7 @@ impl<'a, T: ?Sized> GcCellRef<'a, T> {
     ///
     /// The `GcCell` is already immutably borrowed, so this cannot fail.
     ///
-    /// This is an associated function that needs to be used as GcCellRef::map_split(...).
+    /// This is an associated function that needs to be used as `GcCellRef::map_split(...)`.
     /// A method would interfere with methods of the same name on the contents of a `GcCellRef` used through `Deref`.
     ///
     /// # Examples
@@ -842,18 +863,19 @@ impl<'a, T: Trace + ?Sized, U: ?Sized> GcCellRefMut<'a, T, U> {
         V: ?Sized,
         F: FnOnce(&mut U) -> &mut V,
     {
-        let value = unsafe { &mut *(orig.value as *mut U) };
+        let gc_cell = orig.gc_cell;
 
-        let ret = GcCellRefMut {
-            gc_cell: orig.gc_cell,
+        // Use MaybeUninit to avoid calling the destructor of
+        // GcCellRefMut (which would update the borrow flags) and to
+        // avoid duplicating the mutable reference orig.value (which
+        // would be UB).
+        let orig = mem::MaybeUninit::new(orig);
+        let value = unsafe { ptr::addr_of!((*orig.as_ptr()).value).read() };
+
+        GcCellRefMut {
+            gc_cell,
             value: f(value),
-        };
-
-        // We have to tell the compiler not to call the destructor of GcCellRefMut,
-        // because it will update the borrow flags.
-        std::mem::forget(orig);
-
-        ret
+        }
     }
 }
 
@@ -892,7 +914,7 @@ impl<'a, T: Trace + ?Sized, U: ?Sized> Drop for GcCellRefMut<'a, T, U> {
 
 impl<'a, T: Trace + ?Sized, U: Debug + ?Sized> Debug for GcCellRefMut<'a, T, U> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        Debug::fmt(&*(self.deref()), f)
+        Debug::fmt(&**self, f)
     }
 }
 
@@ -981,6 +1003,8 @@ impl<T: Trace + ?Sized + Debug> Debug for GcCell<T> {
 // For a slice/trait object, this sets the `data` field and leaves the rest
 // unchanged. For a sized raw pointer, this simply sets the pointer.
 unsafe fn set_data_ptr<T: ?Sized, U>(mut ptr: *mut T, data: *mut U) -> *mut T {
-    ptr::write(&mut ptr as *mut _ as *mut *mut u8, data as *mut u8);
+    ptr::addr_of_mut!(ptr)
+        .cast::<*mut u8>()
+        .write(data.cast::<u8>());
     ptr
 }

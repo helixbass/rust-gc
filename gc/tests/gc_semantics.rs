@@ -1,5 +1,4 @@
 use gc::{force_collect, Finalize, Gc, GcCell, Trace};
-use gc_derive::{Finalize, Trace};
 use std::cell::Cell;
 use std::thread::LocalKey;
 
@@ -255,6 +254,7 @@ fn trait_gc() {
             10
         }
     }
+    #[allow(clippy::needless_pass_by_value)]
     fn use_trait_gc(x: Gc<dyn Foo>) {
         assert_eq!(x.f(), 10);
     }
