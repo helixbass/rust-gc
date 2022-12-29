@@ -58,6 +58,7 @@ const ROOTS_MAX: usize = ROOTS_MASK; // max allowed value of roots
 pub(crate) struct GcBoxHeader {
     roots: Cell<usize>, // high bit is used as mark flag
     next: Cell<Option<NonNull<GcBox<dyn Trace>>>>,
+    dyn_trace_ptr: Cell<Option<NonNull<GcBox<dyn Trace>>>>,
 }
 
 impl GcBoxHeader {
@@ -66,6 +67,7 @@ impl GcBoxHeader {
         GcBoxHeader {
             roots: Cell::new(1), // unmarked and roots count = 1
             next: Cell::new(None),
+            dyn_trace_ptr: Default::default(),
         }
     }
 
@@ -106,11 +108,17 @@ impl GcBoxHeader {
     pub fn unmark(&self) {
         self.roots.set(self.roots.get() & !MARK_MASK);
     }
+
+    pub fn push_onto_mark_queue(&self) {
+        MARK_QUEUE.with(|queue| {
+            queue.borrow_mut().push(self.dyn_trace_ptr.get().unwrap());
+        });
+    }
 }
 
 #[repr(C)] // to justify the layout computations in GcBox::from_box, Gc::from_raw
 pub(crate) struct GcBox<T: Trace + ?Sized + 'static> {
-    header: GcBoxHeader,
+    pub header: GcBoxHeader,
     data: T,
 }
 
@@ -209,6 +217,8 @@ unsafe fn insert_gcbox(gcbox: NonNull<GcBox<dyn Trace>>) {
             }
         }
 
+        gcbox.as_ref().header.dyn_trace_ptr.set(Some(gcbox));
+
         let next = st.boxes_start.replace(gcbox);
         gcbox.as_ref().header.next.set(next);
 
@@ -256,6 +266,8 @@ impl<T: Trace + ?Sized> GcBox<T> {
     }
 }
 
+thread_local!(static MARK_QUEUE: RefCell<Vec<NonNull<GcBox<dyn Trace>>>> = Default::default());
+
 /// Collects garbage.
 fn collect_garbage(st: &mut GcState) {
     struct Unmarked<'a> {
@@ -265,13 +277,23 @@ fn collect_garbage(st: &mut GcState) {
     unsafe fn mark(head: &Cell<Option<NonNull<GcBox<dyn Trace>>>>) -> Vec<Unmarked<'_>> {
         // Walk the tree, tracing and marking the nodes
         let mut mark_head = head.get();
-        while let Some(node) = mark_head {
-            if node.as_ref().header.roots() > 0 {
-                node.as_ref().trace_inner();
+        MARK_QUEUE.with(|queue| {
+            queue.borrow_mut().clear();
+            while let Some(node) = mark_head {
+                if node.as_ref().header.roots() > 0 {
+                    node.as_ref().trace_inner();
+                }
+
+                mark_head = node.as_ref().header.next.get();
             }
 
-            mark_head = node.as_ref().header.next.get();
-        }
+            while let Some(node) = {
+                let value = queue.borrow_mut().pop();
+                value
+            } {
+                (*node.as_ptr()).trace_inner();
+            }
+        });
 
         // Collect a vector of all of the nodes which were not marked,
         // and unmark the ones which were.
