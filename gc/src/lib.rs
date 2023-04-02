@@ -404,6 +404,20 @@ impl<T: Trace + ?Sized> std::convert::AsRef<T> for Gc<T> {
     }
 }
 
+impl<'gc, T: Trace + ?Sized, TItem, TIntoIter: std::iter::Iterator<Item = TItem>>
+    std::iter::IntoIterator for &'gc Gc<T>
+where
+    &'gc T: std::iter::IntoIterator<Item = TItem, IntoIter = TIntoIter>,
+{
+    type Item = TItem;
+
+    type IntoIter = TIntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        (&**self).into_iter()
+    }
+}
+
 ////////////
 // GcCell //
 ////////////
