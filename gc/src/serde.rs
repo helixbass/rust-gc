@@ -1,4 +1,4 @@
-use crate::{Gc, Trace};
+use crate::{Gc, GcCell, Trace};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 impl<'de, T: Deserialize<'de> + Trace> Deserialize<'de> for Gc<T> {
@@ -16,5 +16,14 @@ impl<T: Serialize + Trace> Serialize for Gc<T> {
         S: Serializer,
     {
         T::serialize(self, serializer)
+    }
+}
+
+impl<T: Serialize + Trace> Serialize for GcCell<T> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        T::serialize(&self.borrow(), serializer)
     }
 }
