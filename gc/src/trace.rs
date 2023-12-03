@@ -362,3 +362,8 @@ where
         }
     });
 }
+
+impl<T> Finalize for id_arena::Id<T> {}
+unsafe impl<T> Trace for id_arena::Id<T> {
+    unsafe_empty_trace!();
+}
